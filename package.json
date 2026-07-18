@@ -13,6 +13,9 @@
     "express": "^4.18.1",
     "minecraft-data": "^3.103.0",
     "mineflayer": "^4.34.0",
-    "mineflayer-pathfinder": "^2.1.1"
+    "mineflayer-armor-manager": "^2.0.1",
+    "mineflayer-collectblock": "^1.6.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "mineflayer-pvp": "^1.3.2"
   }
 }

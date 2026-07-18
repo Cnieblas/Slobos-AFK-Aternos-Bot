@@ -4,6 +4,8 @@ const { addLog, getLogs } = require("./logger");
 const mineflayer = require("mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
 const { GoalBlock } = goals;
+const armorManager = require("mineflayer-armor-manager");
+const collectBlock = require("mineflayer-collectblock").plugin;
 const config = require("./settings.json");
 const express = require("express");
 const http = require("http");
@@ -1224,6 +1226,8 @@ function createBot() {
     });
 
     bot.loadPlugin(pathfinder);
+    bot.loadPlugin(armorManager);
+    bot.loadPlugin(collectBlock);
 
     // FIX: connection timeout - end the old bot before reconnecting to avoid ghost bots
     clearBotTimeouts();
@@ -1626,6 +1630,9 @@ function initializeModules(bot, mcData, defaultMove) {
     chatModule(bot);
   }
 
+  // Modo bestia: arma+armadura automatica, saqueo de cofres, recoleccion de drops
+  bestiaModule(bot);
+
   addLog("[Modules] All modules initialized!");
 }
 
@@ -1739,15 +1746,27 @@ function avoidMobs(bot) {
 // FIX: attack cooldown for 1.9+ (600ms minimum between attacks)
 // FIX: lock onto a target for multiple ticks instead of randomly switching every tick
 // FIX: autoEat - use i.foodPoints directly (mineflayer item property) instead of broken mcData lookup
+// FIX (bestia): si la vida esta critica, deja de atacar, huye del enemigo mas cercano y come
+const VIDA_CRITICA = 6; // 3 corazones - por debajo de esto, huir en vez de pelear
+const VIDA_SEGURA = 14; // 7 corazones - por encima de esto, retoma modo agresivo
+
 function combatModule(bot, mcData) {
   let lastAttackTime = 0;
   let lockedTarget = null;
   let lockedTargetExpiry = 0;
+  let huyendo = false;
 
   // FIX: use physicsTick (not the deprecated physicTick)
   bot.on("physicsTick", () => {
     if (!bot || !botState.connected) return;
     if (!config.combat["attack-mobs"]) return;
+
+    // Modo bestia: si la vida esta critica, no ataca, prioriza sobrevivir
+    if (bot.health !== undefined && bot.health <= VIDA_CRITICA) {
+      if (typeof bot.pvp !== "undefined" && bot.pvp && bot.pvp.stop) bot.pvp.stop();
+      lockedTarget = null;
+      return;
+    }
 
     const now = Date.now();
     // FIX: 1.9+ attack cooldown - respect at least 600ms between swings
@@ -1790,10 +1809,12 @@ function combatModule(bot, mcData) {
   });
 
   // FIX: autoEat - check foodPoints property on the item directly (works reliably)
+  // FIX (bestia): tambien come comida cuando la vida esta critica, no solo cuando hay poca hambre
   bot.on("health", () => {
     if (!config.combat["auto-eat"]) return;
     try {
-      if (bot.food < 14) {
+      const necesitaComer = bot.food < 14 || bot.health <= VIDA_CRITICA;
+      if (necesitaComer) {
         const food = bot.inventory
           .items()
           .find((i) => i.foodPoints && i.foodPoints > 0);
@@ -1806,6 +1827,33 @@ function combatModule(bot, mcData) {
       }
     } catch (e) {
       addLog("[AutoEat] Error:", e.message);
+    }
+  });
+
+  // Modo bestia: huir del enemigo mas cercano cuando la vida esta critica
+  bot.on("health", () => {
+    try {
+      if (bot.health !== undefined && bot.health <= VIDA_CRITICA && !huyendo) {
+        const amenaza = bot.nearestEntity(
+          (e) => e.type === "mob" || e.type === "hostile",
+        );
+        if (amenaza && typeof bot.setControlState === "function") {
+          huyendo = true;
+          const direccionOpuesta = bot.entity.position
+            .minus(amenaza.position)
+            .normalize();
+          const yaw = Math.atan2(-direccionOpuesta.x, -direccionOpuesta.z);
+          bot.look(yaw, 0, true);
+          bot.setControlState("back", true);
+          setTimeout(() => {
+            if (bot && typeof bot.setControlState === "function")
+              bot.setControlState("back", false);
+            huyendo = false;
+          }, 1500);
+        }
+      }
+    } catch (e) {
+      addLog("[Bestia] Error al huir:", e.message);
     }
   });
 }
@@ -1881,6 +1929,87 @@ function chatModule(bot) {
       addLog("[Chat] Error:", e.message);
     }
   });
+}
+
+// Bestia module
+// Equipa automaticamente la mejor arma y armadura disponible, saquea cofres
+// cercanos y recoge los drops de mobs que caigan cerca. Se apoya en
+// mineflayer-armor-manager y mineflayer-collectblock (ya cargados como plugins).
+const ARMAS_RANKING = [
+  "netherite_sword", "diamond_sword", "iron_sword",
+  "stone_sword", "golden_sword", "wooden_sword",
+  "netherite_axe", "diamond_axe", "iron_axe",
+];
+
+function bestiaModule(bot) {
+  // Equipar la mejor arma disponible en la mano
+  function equiparMejorArma() {
+    if (!bot || !botState.connected) return;
+    try {
+      const inventario = bot.inventory.items();
+      for (const nombreArma of ARMAS_RANKING) {
+        const arma = inventario.find((item) => item.name === nombreArma);
+        if (arma) {
+          bot.equip(arma, "hand").catch(() => {});
+          return;
+        }
+      }
+    } catch (e) {
+      addLog("[Bestia] Error equipando arma:", e.message);
+    }
+  }
+
+  // Armadura: mineflayer-armor-manager decide y equipa las mejores piezas solo
+  addInterval(() => {
+    if (!bot || !botState.connected || !bot.armorManager) return;
+    try {
+      bot.armorManager.equipAll();
+    } catch (e) {
+      addLog("[Bestia] ArmorManager error:", e.message);
+    }
+    equiparMejorArma();
+  }, 5000);
+
+  // Saquear cofres cercanos
+  addInterval(async () => {
+    if (!bot || !botState.connected) return;
+    try {
+      const chestBlock = bot.findBlock({
+        matching: (block) =>
+          block.name === "chest" || block.name === "trapped_chest",
+        maxDistance: 6,
+      });
+      if (!chestBlock) return;
+      const container = await bot.openContainer(chestBlock);
+      const items = container.containerItems();
+      for (const item of items) {
+        await container.withdraw(item.type, null, item.count).catch(() => {});
+      }
+      container.close();
+      addLog("[Bestia] Cofre cercano saqueado.");
+    } catch (e) {
+      // cofre ocupado, fuera de rango o ya vacio - ignoramos
+    }
+  }, 15000);
+
+  // Recoger items tirados cerca (drops de mobs)
+  addInterval(() => {
+    if (!bot || !botState.connected || !bot.collectBlock) return;
+    try {
+      const drop = bot.nearestEntity((e) => e.name === "item");
+      if (drop && bot.entity.position.distanceTo(drop.position) < 10) {
+        bot.collectBlock.collect(drop, (err) => {
+          if (err) addLog("[Bestia] Error recolectando:", err.message);
+        });
+      }
+    } catch (e) {
+      addLog("[Bestia] Error en loop de recoleccion:", e.message);
+    }
+  }, 3000);
+
+  addLog(
+    "[Bestia] Modo bestia activo: equipa gear, saquea cofres, recoge drops.",
+  );
 }
 
 // ============================================================
@@ -2067,7 +2196,7 @@ process.on("SIGINT", () => {
 // START THE BOT
 // ============================================================
 addLog("=".repeat(50));
-addLog("  Minecraft AFK Bot v2.5 - Bug-Fixed Edition");
+addLog("  Minecraft AFK Bot v2.5 - Bug-Fixed Edition (Bestia Mode)");
 addLog("=".repeat(50));
 addLog(`Server: ${config.server.ip}:${config.server.port}`);
 addLog(`Version: ${config.server.version}`);
