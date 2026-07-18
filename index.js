@@ -1632,6 +1632,7 @@ function initializeModules(bot, mcData, defaultMove) {
 
   // Modo bestia: arma+armadura automatica, saqueo de cofres, recoleccion de drops
   bestiaModule(bot);
+  avoidWaterModule(bot);
 
   addLog("[Modules] All modules initialized!");
 }
@@ -1652,13 +1653,21 @@ function startCircleWalk(bot, defaultMove) {
     try {
       const x = bot.entity.position.x + Math.cos(angle) * radius;
       const z = bot.entity.position.z + Math.sin(angle) * radius;
+      const y = bot.entity.position.y;
+
+      // FIX (bestia): si el punto destino es agua, saltar ese angulo
+      // y probar el siguiente en vez de meterse al agua.
+      const destinoBlock = bot.blockAt
+        ? bot.blockAt({ x: Math.floor(x), y: Math.floor(y), z: Math.floor(z) })
+        : null;
+      if (destinoBlock && destinoBlock.name && destinoBlock.name.includes("water")) {
+        angle += Math.PI / 4;
+        return;
+      }
+
       bot.pathfinder.setMovements(defaultMove);
       bot.pathfinder.setGoal(
-        new GoalBlock(
-          Math.floor(x),
-          Math.floor(bot.entity.position.y),
-          Math.floor(z),
-        ),
+        new GoalBlock(Math.floor(x), Math.floor(y), Math.floor(z)),
       );
       angle += Math.PI / 4;
       botState.lastActivity = Date.now();
@@ -1750,6 +1759,28 @@ function avoidMobs(bot) {
 const VIDA_CRITICA = 6; // 3 corazones - por debajo de esto, huir en vez de pelear
 const VIDA_SEGURA = 14; // 7 corazones - por encima de esto, retoma modo agresivo
 
+// FIX (bestia): algunos servidores/versiones clasifican zombies y demas
+// hostiles con e.type === "hostile" en vez de "mob" - usamos ambos mas
+// una lista de nombres como respaldo para no depender solo del type.
+const MOBS_HOSTILES_NOMBRES = [
+  "zombie", "husk", "drowned", "zombie_villager",
+  "skeleton", "stray", "wither_skeleton",
+  "spider", "cave_spider", "creeper", "enderman",
+  "witch", "slime", "phantom", "pillager", "vindicator",
+  "evoker", "ravager", "piglin", "piglin_brute", "hoglin",
+  "zoglin", "blaze", "ghast", "magma_cube", "silverfish",
+  "guardian", "elder_guardian", "shulker", "vex", "warden",
+  "breeze", "bogged",
+];
+
+function esHostil(e) {
+  if (!e) return false;
+  if (e.type === "mob" || e.type === "hostile") return true;
+  if (e.name && MOBS_HOSTILES_NOMBRES.includes(e.name)) return true;
+  if (e.kind && e.kind.toLowerCase().includes("hostile")) return true;
+  return false;
+}
+
 function combatModule(bot, mcData) {
   let lastAttackTime = 0;
   let lockedTarget = null;
@@ -1784,6 +1815,7 @@ function combatModule(bot, mcData) {
         if (dist < 4) {
           bot.attack(lockedTarget);
           lastAttackTime = now;
+          addLog(`[Combat] Atacando ${lockedTarget.name || "entidad"} (dist ${dist.toFixed(1)})`);
           return;
         } else {
           lockedTarget = null;
@@ -1793,7 +1825,7 @@ function combatModule(bot, mcData) {
       // Pick a new target
       const mobs = Object.values(bot.entities).filter(
         (e) =>
-          e.type === "mob" &&
+          esHostil(e) &&
           e.position &&
           bot.entity.position.distanceTo(e.position) < 4,
       );
@@ -1802,6 +1834,7 @@ function combatModule(bot, mcData) {
         lockedTargetExpiry = now + 3000; // stick to same mob for 3 seconds
         bot.attack(lockedTarget);
         lastAttackTime = now;
+        addLog(`[Combat] Nuevo objetivo: ${lockedTarget.name || "entidad"}`);
       }
     } catch (e) {
       addLog("[Combat] Error:", e.message);
@@ -1834,9 +1867,7 @@ function combatModule(bot, mcData) {
   bot.on("health", () => {
     try {
       if (bot.health !== undefined && bot.health <= VIDA_CRITICA && !huyendo) {
-        const amenaza = bot.nearestEntity(
-          (e) => e.type === "mob" || e.type === "hostile",
-        );
+        const amenaza = bot.nearestEntity((e) => esHostil(e));
         if (amenaza && typeof bot.setControlState === "function") {
           huyendo = true;
           const direccionOpuesta = bot.entity.position
@@ -2010,6 +2041,52 @@ function bestiaModule(bot) {
   addLog(
     "[Bestia] Modo bestia activo: equipa gear, saquea cofres, recoge drops.",
   );
+}
+
+// Avoid water module
+// Si el bot entra al agua, sale nadando/saltando hacia atras. No evita
+// el 100% de las veces que se acerque (el pathfinder ya tiene liquidCost
+// alto), pero garantiza que no se quede atorado nadando indefinidamente.
+function avoidWaterModule(bot) {
+  let saliendo = false;
+
+  addInterval(() => {
+    if (!bot || !botState.connected || typeof bot.setControlState !== "function")
+      return;
+    try {
+      const enAgua =
+        bot.entity.isInWater ||
+        (bot.blockAt &&
+          bot.blockAt(bot.entity.position) &&
+          bot.blockAt(bot.entity.position).name &&
+          bot.blockAt(bot.entity.position).name.includes("water"));
+
+      if (enAgua && !saliendo) {
+        saliendo = true;
+        addLog("[Bestia] Detectada agua cerca/debajo - saliendo...");
+        // Cancela cualquier meta de pathfinder que lo este llevando al agua
+        if (bot.pathfinder && bot.pathfinder.setGoal) {
+          try {
+            bot.pathfinder.setGoal(null);
+          } catch (e) {}
+        }
+        bot.setControlState("jump", true);
+        bot.setControlState("back", true);
+        setTimeout(() => {
+          if (bot && typeof bot.setControlState === "function") {
+            bot.setControlState("jump", false);
+            bot.setControlState("back", false);
+          }
+          saliendo = false;
+        }, 1200);
+      }
+    } catch (e) {
+      saliendo = false;
+      addLog("[Bestia] Error evitando agua:", e.message);
+    }
+  }, 1000);
+
+  addLog("[Bestia] Modulo anti-agua activo.");
 }
 
 // ============================================================
